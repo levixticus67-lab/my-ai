@@ -18,6 +18,7 @@ Usage:
   python main.py --resume                    # resume training from last checkpoint
   python main.py --benchmark                 # run throughput + latency benchmarks
   python main.py --export                    # inspect architecture + FLOPs
+  python main.py --augment                   # augment training data before training
   python main.py --prompt "def fib("        # single-shot generation (no REPL)
   python main.py --list-presets              # show available model size presets
 """
@@ -237,6 +238,22 @@ def main() -> None:
     parser.add_argument("--top_k", "-k", type=int, default=40,
                         help="Top-k filtering for top-k strategy (default: 40).")
 
+    # ── Data augmentation ────────────────────────────────────────────────────
+    parser.add_argument("--augment", action="store_true",
+                        help=(
+                            "Augment training data before training.\n"
+                            "Writes augmented files to training_data_aug/ then trains on that."
+                        ))
+    parser.add_argument("--augment-dir", default="training_data_aug",
+                        help="Output directory for augmented data (default: training_data_aug).")
+    parser.add_argument("--augment-copies", type=int, default=2,
+                        help="Augmented copies per source file (default: 2).")
+    parser.add_argument("--augment-techniques", nargs="+", default=None,
+                        metavar="TECHNIQUE",
+                        help="Specific augmentation techniques to apply (default: all).")
+    parser.add_argument("--list-techniques", action="store_true",
+                        help="List all available data augmentation techniques and exit.")
+
     # ── Tooling ───────────────────────────────────────────────────────────────
     parser.add_argument("--benchmark", action="store_true",
                         help="Run training throughput + inference latency benchmarks.")
@@ -248,6 +265,14 @@ def main() -> None:
     # ── --list-presets ───────────────────────────────────────────────────────
     if args.list_presets:
         list_presets()
+        sys.exit(0)
+
+    if args.list_techniques:
+        from data_augment import TECHNIQUES
+        print("\nAvailable augmentation techniques:\n")
+        for name, (_, desc) in TECHNIQUES.items():
+            print(f"  {name:<20}  {desc}")
+        print()
         sys.exit(0)
 
     # ── Resolve config ───────────────────────────────────────────────────────
@@ -289,8 +314,24 @@ def main() -> None:
         _run_export()
         return
 
+    # ── Data augmentation (runs before training) ─────────────────────────────
+    if args.augment:
+        from data_augment import augment_directory, measure_expansion
+        aug_dir = args.augment_dir
+        print(f"\n[main] Augmenting training data → '{aug_dir}' ...")
+        augment_directory(
+            src_dir    = CONFIG["training_dir"],
+            out_dir    = aug_dir,
+            techniques = args.augment_techniques,
+            n_copies   = args.augment_copies,
+        )
+        measure_expansion(CONFIG["training_dir"], aug_dir)
+        # Point training at the augmented directory
+        CONFIG["training_dir"] = aug_dir
+        print(f"[main] Training will use augmented data from '{aug_dir}'.")
+
     # ── Train if necessary ────────────────────────────────────────────────────
-    if args.retrain or not _weights_exist():
+    if args.augment or args.retrain or not _weights_exist():
         _train()
     else:
         print(

@@ -54,6 +54,7 @@ def fibonacci(n):
 | `beam_search.py` | **[NEW]** Full beam search decoder with length normalisation |
 | `benchmark.py` | **[NEW]** Training throughput + inference latency benchmarker |
 | `export.py` | **[NEW]** TorchScript / ONNX export, architecture inspector, FLOPs estimator |
+| `data_augment.py` | **[NEW]** 8 code-transformation techniques that multiply training data without new files |
 
 ---
 
@@ -416,6 +417,63 @@ ml-pipeline/
 - AdamW + gradient clipping + cosine LR warmup
 - Mid-training checkpointing with val-loss ranking
 - Three generation strategies: greedy, top-k sampling, beam search
+
+---
+
+---
+
+### Feature 8 — Data Augmentation (`data_augment.py`)
+
+Generates additional training examples from your existing source files by
+applying **8 semantics-preserving code transformations**.  No new files
+needed — the augmented corpus is written to a separate directory and training
+is automatically redirected there.
+
+| Technique | What it does |
+|-----------|-------------|
+| `variable_rename` | Swaps common short identifiers (`i`, `n`, `x`, `res`, …) with synonyms (`idx`, `count`, `val`, `out`, …) |
+| `comment_strip` | Removes all `# …` inline comments and `"""…"""` block comments |
+| `whitespace_norm` | Strips trailing spaces, collapses 3+ consecutive blank lines to 2 |
+| `indent_convert` | Toggles between 2-space and 4-space indentation |
+| `string_shuffle` | Swaps `'single'` ↔ `"double"` quoted strings where safe |
+| `dead_code_insert` | Inserts harmless `pass` / `...` statements in random `def`/`class` bodies |
+| `docstring_strip` | Removes function and class docstrings (keeps `pass` so body stays valid) |
+| `import_shuffle` | Randomly reorders top-level `import` / `from … import` lines |
+
+**Why it matters:** A model that only ever sees `i` as a loop counter, or
+4-space indentation, will be fragile.  Augmentation exposes it to the same
+logic written in many superficially different ways — improving generalisation
+without requiring you to write or source more code.
+
+```bash
+# Augment training_data/ → training_data_aug/, then train on augmented data
+python main.py --augment
+
+# Choose how many copies per file (default: 2 → 3× corpus size)
+python main.py --augment --augment-copies 4
+
+# Use only specific techniques
+python main.py --augment --augment-techniques comment_strip whitespace_norm variable_rename
+
+# See all available techniques
+python main.py --list-techniques
+
+# Run augmentation standalone (no training)
+python data_augment.py --src training_data/ --out training_data_aug/ --copies 3
+
+# Print corpus size expansion ratio after augmenting
+python data_augment.py --src training_data/ --out training_data_aug/ --measure
+```
+
+Each augmented copy applies a **random subset** of the requested techniques,
+so the copies are genuinely distinct rather than all identical transforms.
+
+```
+Corpus expansion:
+  Before :       8,432 chars  (training_data/)
+  After  :      25,296 chars  (training_data_aug/)
+  Ratio  : 3.00×
+```
 
 ---
 
