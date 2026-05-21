@@ -1,487 +1,268 @@
-# my-ai — Local Code Completion Transformer
+# Agent Runtime — Local Autonomous Multi-Agent Engine
 
-A fully self-contained, character-level (or BPE) Transformer Language Model
-that trains on your own source files and runs **offline** code-completion
-inference entirely in the terminal.  No cloud APIs, no web servers, no
-internet required after setup.
+A fully self-contained, event-driven autonomous agent that takes a plain-English programming task, plans execution using an LLM, writes real code files, installs dependencies, runs them, and **self-corrects autonomously** up to 4 times when the generated code fails — all streamed live to a terminal-style dashboard.
+
+No LangChain. No wrappers. Native Node.js core loop.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    AGENT RUNTIME                        │
+│                                                         │
+│  ┌──────────────┐     ┌──────────────┐                  │
+│  │  LLM Client  │────▶│   Engine     │                  │
+│  │  (client.js) │◀────│  (engine.js) │                  │
+│  └──────────────┘     └──────┬───────┘                  │
+│   Gemini / Ollama            │                          │
+│                       ┌──────▼───────┐                  │
+│                       │    Tools     │                  │
+│                       │  (tools.js)  │                  │
+│                       │  fileSystem  │                  │
+│                       │  depManager  │                  │
+│                       │  execUnit    │                  │
+│                       └──────────────┘                  │
+│                              │                          │
+│              ┌───────────────▼────────────────┐         │
+│              │        ./workspace/             │         │
+│              │   (all generated code lives     │         │
+│              │    here — fully sandboxed)       │         │
+│              └────────────────────────────────┘         │
+│                                                         │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │    Express API Server  (server.js)               │   │
+│  │    POST /api/run        → start task             │   │
+│  │    GET  /api/stream     → SSE log stream         │   │
+│  │    GET  /api/workspace-tree → file list          │   │
+│  │    DELETE /api/workspace   → clear sandbox       │   │
+│  └──────────────────────────────────────────────────┘   │
+│                         ▲                               │
+│  ┌──────────────────────┴───────────────────────────┐   │
+│  │    React Dashboard  (src/ui/)                    │   │
+│  │    Left panel  → live SSE engine logs            │   │
+│  │    Right panel → workspace file tree             │   │
+│  │    Input bar   → submit tasks                    │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Quick Start
 
+### 1. Install dependencies
+
 ```bash
-# 1. Install PyTorch (one-time)
-pip install torch --user
-
-# 2. Drop your .py / .js source files into training_data/
-#    (sample files are already included)
-
-# 3. Train + generate — all in one command
-cd ml-pipeline
-python main.py
+cd agent-runtime
+npm install
 ```
 
-After training you land in an interactive REPL:
+### 2. Configure your LLM
+
+**Option A — Google Gemini (recommended, cloud):**
+```bash
+cp .env.example .env
+# Edit .env and set GEMINI_API_KEY=your_key_here
+```
+Get a free key at https://aistudio.google.com/apikey
+
+**Option B — Local Ollama (fully offline, no key needed):**
+```bash
+ollama serve           # start Ollama daemon
+ollama pull llama3.2   # or any model you prefer
+# No .env needed — engine auto-detects absence of GEMINI_API_KEY
+```
+
+### 3. Start everything
+
+```bash
+npm run dev
+```
+
+This starts two processes concurrently:
+- **API server** on `http://localhost:4000`
+- **React dashboard** on `http://localhost:3000`
+
+Open `http://localhost:3000` in your browser.
+
+---
+
+## How It Works — The Autonomous Loop
 
 ```
->>> def fibonacci(
-def fibonacci(n):
-    if n <= 1:
-        return n
-    a, b = 0, 1
-    for _ in range(2, n + 1):
-        a, b = b, a + b
-    return b
+User submits task
+       │
+       ▼
+  LLM generates JSON plan
+  { files[], install[], run, verify }
+       │
+       ▼
+  Engine writes files → ./workspace/
+       │
+       ▼
+  npm install packages (if any)
+       │
+       ▼
+  Syntax check (verify command)
+       │
+    PASS? ──NO──▶ Build correction prompt with error text
+       │                    │
+       │         Re-query LLM (up to 4 times)
+       │                    │
+       ▼                    ▼
+  Execute (run command)   Retry loop
+       │
+    EXIT 0? ──NO──▶ Intercept stderr
+       │            Build correction prompt
+       │            Re-query LLM (up to 4 times)
+       ▼
+  DONE ✓
+```
+
+Every step emits a named log event (`[TOOL EXECUTION]`, `[COMPILER ERROR]`, `[AUTONOMOUS RETRY]`, etc.) that streams over SSE to the dashboard.
+
+---
+
+## Test Case: The Built-in Demo
+
+Submit this task in the dashboard input:
+
+> **"Create a local Express server file with an active port listening for JSON payloads, verify its syntax, and install the cors package automatically."**
+
+The engine will:
+1. Query the LLM → receive a JSON plan with `server.js`, `install: ["express","cors"]`, `run: "node --check server.js"`
+2. Write `workspace/server.js`
+3. Run `npm install express cors` inside `workspace/`
+4. Run `node --check server.js` (syntax verify)
+5. Execute `node server.js` — server binds, prints `LISTENING`, exits 0
+6. Dashboard shows all steps streamed live; right panel shows `server.js` appear in the file tree
+
+If the LLM writes broken code on attempt 1, the engine automatically feeds the exact `stderr` back with a structured correction prompt and retries.
+
+---
+
+## File Structure
+
+```
+agent-runtime/
+├── index.html                   Vite HTML entry
+├── package.json                 Dependencies + npm scripts
+├── vite.config.js               Vite: port 3000, proxy /api → :4000
+├── tailwind.config.js
+├── postcss.config.js
+├── .env.example                 Copy to .env and add GEMINI_API_KEY
+│
+├── src/
+│   ├── llm/
+│   │   └── client.js            LLM gateway (Gemini / Ollama, JSON-strict)
+│   │
+│   ├── runtime/
+│   │   ├── tools.js             fileSystem · dependencyManager · executionUnit
+│   │   └── engine.js            Autonomous self-correction loop (EventEmitter)
+│   │
+│   ├── api/
+│   │   └── server.js            Express + SSE daemon (port 4000)
+│   │
+│   └── ui/
+│       ├── index.css            Tailwind entry
+│       ├── main.jsx             React entry
+│       ├── App.jsx              Root: SSE connection, layout, state
+│       └── components/
+│           ├── TaskInput.jsx    Task submit bar + quick examples
+│           ├── LogPanel.jsx     Left: colour-coded live log stream
+│           └── FileTree.jsx     Right: workspace directory explorer
+│
+└── workspace/                   SANDBOX — all generated code lives here
+    └── (created at runtime)
 ```
 
 ---
 
-## Module Map
+## Module Deep-Dives
 
-| File | What it does |
-|------|-------------|
-| `main.py` | Unified entry point — trains if needed, then opens the generation REPL |
-| `config.py` | Preset manager (small / medium / large) + YAML/JSON file support |
-| `tokenizer.py` | Character-level vocabulary builder, encode / decode |
-| `bpe_tokenizer.py` | **[NEW]** Byte Pair Encoding tokenizer — better subword coverage |
-| `model.py` | Decoder-only Transformer built from scratch with PyTorch |
-| `dataset.py` | `CodeDataset` + `DataLoader` — sliding context windows, (X, Y) pairs |
-| `train.py` | AdamW training loop with scheduler, validation, and checkpointing |
-| `generate.py` | Greedy / top-k / beam inference with token streaming |
-| `checkpoint.py` | **[NEW]** Mid-training checkpoint manager — save, resume, prune |
-| `evaluate.py` | **[NEW]** Validation split + perplexity tracking per epoch |
-| `lr_scheduler.py` | **[NEW]** Cosine / linear / constant warmup LR schedulers |
-| `beam_search.py` | **[NEW]** Full beam search decoder with length normalisation |
-| `benchmark.py` | **[NEW]** Training throughput + inference latency benchmarker |
-| `export.py` | **[NEW]** TorchScript / ONNX export, architecture inspector, FLOPs estimator |
-| `data_augment.py` | **[NEW]** 8 code-transformation techniques that multiply training data without new files |
+### `src/llm/client.js` — Agnostic LLM Gateway
 
----
+- Detects `GEMINI_API_KEY` → uses `@google/genai` SDK with `gemini-2.5-flash`
+- No key → falls back to `http://localhost:11434/api/generate` (Ollama)
+- **Strict JSON enforcement**: extracts JSON from markdown fences, retries up to 3× with a self-correction prompt if the model returns invalid JSON
+- Configurable via `OLLAMA_URL` and `OLLAMA_MODEL` env vars
 
-## Full CLI Reference
+### `src/runtime/tools.js` — System Handlers
 
-### `main.py` — primary entry point
+Three modules, all sandboxed to `./workspace`:
 
-```bash
-# Auto-train if no weights exist, then open generation REPL
-python main.py
+| Module | Functions |
+|--------|-----------|
+| `fileSystem` | `write`, `read`, `append`, `exists`, `list`, `remove`, `ensureWorkspace` |
+| `dependencyManager` | `install(packages[])`, `restore()` — runs real `npm install` |
+| `executionUnit` | `run(command, {timeout, env})` — returns `{stdout, code}` or throws with exact stderr |
 
-# Force re-train even if weights already exist
-python main.py --retrain
+Path traversal is blocked at the `safeResolve()` layer — no `../../` escapes.
 
-# Resume training from the latest mid-run checkpoint
-python main.py --resume
+### `src/runtime/engine.js` — The Core Loop
 
-# Use a larger model preset
-python main.py --preset medium
+A stateful `EventEmitter` class. Runs up to `MAX_RETRIES = 4` times per task:
 
-# Load hyperparams from a custom YAML/JSON config file
-python main.py --config my_run.yaml
+1. Builds a system-prompt + task → structured JSON plan
+2. Writes all files, installs packages, runs verify + run commands
+3. On any failure: captures exact `stderr`, constructs a correction prompt with the original task + broken file content + error text, re-queries the LLM
+4. Emits `log`, `done`, `error` events consumed by the SSE server
 
-# Save the resolved config to a file (then edit and reuse)
-python main.py --preset medium --save-config medium.yaml
+### `src/api/server.js` — The Daemon
 
-# Change generation strategy
-python main.py --strategy greedy
-python main.py --strategy beam --beam-width 5
-
-# Use BPE tokenization instead of character-level
-python main.py --tokenizer bpe --bpe-vocab-size 2000
-
-# Single-shot generation (no REPL, exits after printing)
-python main.py --prompt "def fibonacci(" --max_tokens 200
-
-# Run benchmarks (trains first if needed)
-python main.py --benchmark
-
-# Inspect architecture + FLOPs (trains first if needed)
-python main.py --export
-
-# Show all model size presets
-python main.py --list-presets
-```
-
-### `generate.py` — standalone inference
-
-```bash
-python generate.py --prompt "def quicksort(" --strategy topk --max_tokens 300
-python generate.py --prompt "class BinaryTree:" --strategy greedy
-python generate.py --prompt "for i in range(" --strategy beam --beam-width 5
-```
-
-### `beam_search.py` — standalone beam search
-
-```bash
-python beam_search.py --prompt "def merge_sort(" --beam-width 5 --top-n 3
-python beam_search.py --prompt "class Graph:" --beam-width 8 --length-penalty 0.6
-```
-
-### `checkpoint.py` — checkpoint management
-
-```bash
-# List all saved checkpoints with their val losses
-python checkpoint.py --list
-
-# List from a non-default directory
-python checkpoint.py --dir my_checkpoints --list
-```
-
-### `lr_scheduler.py` — preview a schedule
-
-```bash
-python lr_scheduler.py --scheduler cosine --warmup 200 --total-steps 5000 --plot
-python lr_scheduler.py --scheduler linear --warmup 100 --total-steps 3000
-```
-
-### `bpe_tokenizer.py` — train or test BPE vocabulary
-
-```bash
-python bpe_tokenizer.py --train training_data/ --vocab-size 1000 --out bpe_vocab.json
-python bpe_tokenizer.py --vocab bpe_vocab.json --test "def fibonacci(n):"
-```
-
-### `benchmark.py` — performance measurement
-
-```bash
-python benchmark.py
-python benchmark.py --fast --out results.json
-python benchmark.py --preset medium
-```
-
-### `export.py` — export and inspection
-
-```bash
-# Architecture summary + FLOPs estimate
-python export.py --inspect --flops
-
-# Weight statistics (detect instability)
-python export.py --weight-stats
-
-# Export to TorchScript (runs without source code)
-python export.py --torchscript --out-dir exports/
-
-# Export to ONNX (for deployment with ONNX Runtime, TensorRT, CoreML, etc.)
-python export.py --onnx --out-dir exports/
-
-# Run all tasks at once
-python export.py --all
-```
-
-### `config.py` — preset viewer and saver
-
-```bash
-python config.py --list
-python config.py --save medium --format yaml
-```
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/api/health` | GET | Status, provider, uptime, busy flag |
+| `/api/stream` | GET | SSE — all engine events in real time |
+| `/api/run` | POST | Submit `{ task }` — 202 Accepted, progress via SSE |
+| `/api/workspace-tree` | GET | Recursive file list with sizes |
+| `/api/workspace-file` | GET | Read a file `?path=relative/path` |
+| `/api/workspace` | DELETE | Clear the sandbox |
 
 ---
 
-## Model Presets
+## SSE Event Schema
 
-| Preset | Est. Params | n_embd | Heads | Layers | Block | Best for |
-|--------|------------|--------|-------|--------|-------|----------|
-| small  | ~109K      | 128    | 4     | 4      | 128   | CPU, quick experiments |
-| medium | ~870K      | 256    | 8     | 6      | 256   | GPU, medium corpus |
-| large  | ~6.8M      | 512    | 8     | 8      | 512   | CUDA GPU, large corpus |
-
-Edit any hyperparameter by saving a config file and passing it with `--config`:
-
-```bash
-python config.py --save small          # writes small.yaml
-# Edit small.yaml: change max_epochs to 20, batch_size to 64 ...
-python main.py --config small.yaml
+Every event over `/api/stream` is:
+```json
+{
+  "type":    "log | done | error | connected | ping",
+  "payload": { "level": "info|ok|warn|error", "tag": "AGENT", "message": "…" },
+  "ts":      "2025-01-01T12:00:00.000Z"
+}
 ```
+
+Log tag examples and their colours in the dashboard:
+
+| Tag | Colour | Meaning |
+|-----|--------|---------|
+| `TOOL EXECUTION` | Blue | Running a shell command |
+| `COMPILER ERROR` | Red | Non-zero exit / syntax failure |
+| `AUTONOMOUS RETRY` | Yellow | Sending error back to LLM |
+| `LLM REQUEST` | Green | Calling the model |
+| `FILE WRITER` | Purple | Writing files to workspace |
+| `DEPENDENCY MANAGER` | Purple | npm install running |
+| `AGENT` | Green | Top-level loop status |
 
 ---
 
-## Feature Deep-Dives
+## Environment Variables
 
-### Feature 1 — Checkpoint Manager (`checkpoint.py`)
-
-Saves a snapshot of model weights **and** optimizer state every N optimiser
-steps during training.  Keeps only the top-K checkpoints by validation loss
-(older/worse ones are automatically deleted).
-
-**Why it matters:** If your machine crashes mid-training, you lose nothing.
-Resume from where you left off with `--resume`.
-
-```bash
-# Resume training from the latest checkpoint
-python main.py --resume
-
-# See what checkpoints exist and which has the best val loss
-python checkpoint.py --list
-```
-
-Config keys (in `main.py`'s `CONFIG` or a YAML file):
-```yaml
-checkpoint_dir:   checkpoints    # folder for checkpoint files
-checkpoint_every: 500            # save every N optimiser steps
-keep_top_k:       3              # keep only the 3 best checkpoints
-```
-
----
-
-### Feature 2 — Validation & Perplexity Tracking (`evaluate.py`)
-
-Automatically splits the corpus into a **training set** (90%) and a
-**held-out validation set** (10%) before training begins.  After every
-epoch (and optionally every N steps), the model is evaluated on the
-validation set and its **perplexity** is printed.
-
-**Perplexity** measures how "surprised" the model is by unseen text.
-Lower = better.  A random model on a 91-character vocabulary has perplexity
-≈ 91.  A well-trained model reaches 10–30.
-
-At the end of training a full history table is printed:
-
-```
-  VALIDATION HISTORY
-  Epoch     Step    Val Loss  Perplexity
-  ───────────────────────────────────────
-      1     1500      2.9431       19.00  ← best
-      2     3000      3.0812       21.78
-```
-
-Config keys:
-```yaml
-val_ratio:   0.1   # fraction of corpus held out
-eval_every:  500   # also evaluate mid-epoch every N steps (0 = epoch only)
-```
-
----
-
-### Feature 3 — BPE Tokenizer (`bpe_tokenizer.py`)
-
-A pure-Python **Byte Pair Encoding** tokenizer that compresses common
-substrings (keywords, common identifiers) into single tokens.
-
-**Why it matters:** Character-level models waste context on common patterns
-like `def `, `return `, `    ` (indentation).  BPE turns these into single
-tokens, so the model sees more meaningful context in the same block size.
-
-```bash
-# Train BPE vocabulary and test it
-python bpe_tokenizer.py --train training_data/ --vocab-size 1000 --out bpe_vocab.json
-python bpe_tokenizer.py --vocab bpe_vocab.json --test "def fibonacci(n):"
-# Output:
-#   Input   : 'def fibonacci(n):'
-#   Tokens  : ['def ', 'fib', 'on', 'acci', '(n):']
-#   Ratio   : 5/18 tokens/chars
-
-# Use BPE for training + generation
-python main.py --tokenizer bpe --bpe-vocab-size 1000
-```
-
----
-
-### Feature 4 — LR Scheduler with Warmup (`lr_scheduler.py`)
-
-Three learning-rate schedules, all with a **linear warmup** phase:
-
-| Schedule | After warmup |
-|----------|-------------|
-| `cosine` | Smoothly decays to `min_lr` following a cosine curve |
-| `linear` | Linearly decays to `min_lr` |
-| `constant` | Holds at the peak LR for the rest of training |
-
-**Why it matters:** Jumping straight to `lr=1e-3` on step 1 can destabilize
-training.  Warmup lets the optimizer build reliable gradient estimates first.
-Cosine decay then gently reduces the LR as the model converges, squeezing
-out extra performance.
-
-```bash
-# Preview the cosine schedule as an ASCII chart
-python lr_scheduler.py --scheduler cosine --warmup 200 --total-steps 5000 --plot
-```
-
-Config keys:
-```yaml
-scheduler:     cosine   # cosine | linear | constant
-warmup_steps:  200
-min_lr_ratio:  0.1      # floor = base_lr × min_lr_ratio
-```
-
----
-
-### Feature 5 — Beam Search Decoder (`beam_search.py`)
-
-Instead of greedily picking one token at a time, beam search keeps the **B
-most probable token sequences** alive simultaneously, then ranks them at the
-end by a **length-normalised score**.
-
-**Why it matters:** Top-k sampling is creative but sometimes incoherent.
-Greedy is coherent but can get stuck in repetitive loops.  Beam search finds
-higher-probability completions and returns **multiple ranked candidates**,
-giving you options.
-
-```bash
-# Generate with beam search, show top 3 candidates
-python main.py --strategy beam --beam-width 5
-python beam_search.py --prompt "def merge_sort(" --beam-width 5 --top-n 3
-```
-
-Key parameters:
-- `--beam-width` — number of beams (higher = better quality, slower)
-- `--length-penalty` — 0.0 favours short, 1.0 favours long (default 0.7)
-- `--rep-penalty` — values > 1.0 penalise repeated tokens
-
----
-
-### Feature 6 — Performance Benchmarker (`benchmark.py`)
-
-Measures two things automatically:
-
-1. **Training throughput** — how many tokens per second the forward + backward
-   pass processes on your hardware.
-2. **Inference latency** — milliseconds per generated token at different
-   prompt lengths.
-
-Outputs a formatted report, optionally saved as JSON for comparison runs.
-
-```bash
-python benchmark.py
-# Output:
-#   ── TRAINING THROUGHPUT ──
-#      Tokens/sec :      24,310
-#      ms / step  :      42.40
-#
-#   ── INFERENCE LATENCY ──────
-#     Prompt Len   ms/token        ±   tok/sec
-#              8       3.21     0.12     311.8
-#             32       3.45     0.09     289.7
-#             64       3.89     0.15     257.1
-
-python benchmark.py --out results.json   # save for later comparison
-python benchmark.py --fast               # quick smoke-test
-```
-
----
-
-### Feature 7 — Model Export & Inspector (`export.py`)
-
-Four tools in one script:
-
-| Tool | What it does |
-|------|-------------|
-| `--inspect` | Per-layer parameter count breakdown + distribution bar chart |
-| `--flops` | Analytic FLOPs/MACs estimate for one forward pass |
-| `--weight-stats` | min/max/mean/std of every parameter (detects instability) |
-| `--torchscript` | Export to `.pt` — runs anywhere PyTorch is installed, no source needed |
-| `--onnx` | Export to `.onnx` — deploy with ONNX Runtime, TensorRT, CoreML, etc. |
-
-```bash
-# Inspect architecture
-python export.py --inspect --flops
-# Output:
-#   Vocab size   : 91
-#   Embedding dim: 128
-#   Heads        : 4  (head_dim = 32)
-#   Layers       : 4
-#   ...
-#   TOTAL FLOPs (≈2×MACs)         179.7 M
-
-# Export to TorchScript for deployment
-python export.py --torchscript --out-dir exports/
-# → exports/model.pt  (self-contained, no source code needed)
-
-# Run everything
-python export.py --all
-```
-
----
-
-## Generated Files (at runtime)
-
-```
-ml-pipeline/
-├── vocab.json            character-level vocabulary
-├── bpe_vocab.json        BPE vocabulary (if --tokenizer bpe was used)
-├── model_weights.pth     final trained weights
-├── checkpoints/          mid-training snapshots
-│   ├── checkpoint_index.json
-│   ├── checkpoint_step0000500_loss2.3410.pth
-│   └── checkpoint_step0001000_loss1.9823.pth
-└── exports/              TorchScript / ONNX output (after python export.py)
-    ├── model.pt
-    └── model.onnx
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEMINI_API_KEY` | — | Google Gemini API key. If absent, Ollama is used. |
+| `OLLAMA_URL` | `http://localhost:11434/api/generate` | Ollama endpoint |
+| `OLLAMA_MODEL` | `llama3.2` | Ollama model to use |
+| `SERVER_PORT` | `4000` | Express server port |
 
 ---
 
 ## Stack
 
-- Python 3.11 · PyTorch 2.x (CPU or CUDA)
-- Decoder-only Transformer — Pre-LayerNorm, causal self-attention, GeLU FFN, weight tying
-- Character-level **or** BPE tokenisation
-- AdamW + gradient clipping + cosine LR warmup
-- Mid-training checkpointing with val-loss ranking
-- Three generation strategies: greedy, top-k sampling, beam search
-
----
-
----
-
-### Feature 8 — Data Augmentation (`data_augment.py`)
-
-Generates additional training examples from your existing source files by
-applying **8 semantics-preserving code transformations**.  No new files
-needed — the augmented corpus is written to a separate directory and training
-is automatically redirected there.
-
-| Technique | What it does |
-|-----------|-------------|
-| `variable_rename` | Swaps common short identifiers (`i`, `n`, `x`, `res`, …) with synonyms (`idx`, `count`, `val`, `out`, …) |
-| `comment_strip` | Removes all `# …` inline comments and `"""…"""` block comments |
-| `whitespace_norm` | Strips trailing spaces, collapses 3+ consecutive blank lines to 2 |
-| `indent_convert` | Toggles between 2-space and 4-space indentation |
-| `string_shuffle` | Swaps `'single'` ↔ `"double"` quoted strings where safe |
-| `dead_code_insert` | Inserts harmless `pass` / `...` statements in random `def`/`class` bodies |
-| `docstring_strip` | Removes function and class docstrings (keeps `pass` so body stays valid) |
-| `import_shuffle` | Randomly reorders top-level `import` / `from … import` lines |
-
-**Why it matters:** A model that only ever sees `i` as a loop counter, or
-4-space indentation, will be fragile.  Augmentation exposes it to the same
-logic written in many superficially different ways — improving generalisation
-without requiring you to write or source more code.
-
-```bash
-# Augment training_data/ → training_data_aug/, then train on augmented data
-python main.py --augment
-
-# Choose how many copies per file (default: 2 → 3× corpus size)
-python main.py --augment --augment-copies 4
-
-# Use only specific techniques
-python main.py --augment --augment-techniques comment_strip whitespace_norm variable_rename
-
-# See all available techniques
-python main.py --list-techniques
-
-# Run augmentation standalone (no training)
-python data_augment.py --src training_data/ --out training_data_aug/ --copies 3
-
-# Print corpus size expansion ratio after augmenting
-python data_augment.py --src training_data/ --out training_data_aug/ --measure
-```
-
-Each augmented copy applies a **random subset** of the requested techniques,
-so the copies are genuinely distinct rather than all identical transforms.
-
-```
-Corpus expansion:
-  Before :       8,432 chars  (training_data/)
-  After  :      25,296 chars  (training_data_aug/)
-  Ratio  : 3.00×
-```
-
----
-
-## Improving Output Quality
-
-1. **Add more training data** — drop `.py` / `.js` files into `training_data/`
-   and run `python main.py --retrain`.
-2. **Use a larger preset** — `python main.py --preset medium` (needs a GPU).
-3. **Switch to BPE** — `python main.py --tokenizer bpe` for more efficient tokenisation.
-4. **Train longer** — edit `max_epochs` in a config YAML.
-5. **Use beam search** — `python main.py --strategy beam` for higher-quality completions.
+- **Runtime**: Node.js 20+ (ES Modules)
+- **LLM**: Google Gemini (`@google/genai`) or local Ollama
+- **API**: Express 4, Server-Sent Events
+- **Frontend**: React 18, Vite 5, Tailwind CSS 3
+- **Tools**: native `node:child_process`, `node:fs/promises` — zero wrapper libraries
